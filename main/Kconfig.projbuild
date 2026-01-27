@@ -7,5 +7,7 @@ menu "Example Configuration"
                 bool "lan8671"
             config EXAMPLE_BUILD_WIFI
                 bool "wifi"
+            config EXAMPLE_BUILD_IPERF_ETHERNET
+                bool "iperf_ethernet"
     endchoice
 endmenu

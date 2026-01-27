@@ -3,6 +3,8 @@ if(CONFIG_EXAMPLE_BUILD_LAN8671)
     set(project_path "examples/lan8671/")
 elseif(CONFIG_EXAMPLE_BUILD_WIFI)
     set(project_path "examples/wifi/")
+elseif(CONFIG_EXAMPLE_BUILD_IPERF_ETHERNET)
+    set(project_path "examples/iperf_ethernet/")
 endif()
         
 idf_component_register(SRC_DIRS ${project_path} 
