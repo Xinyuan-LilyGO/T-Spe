@@ -9,5 +9,7 @@ menu "Example Configuration"
                 bool "wifi"
             config EXAMPLE_BUILD_IPERF_ETHERNET
                 bool "iperf_ethernet"
+            config EXAMPLE_BUILD_RS485
+                bool "rs485"
     endchoice
 endmenu
