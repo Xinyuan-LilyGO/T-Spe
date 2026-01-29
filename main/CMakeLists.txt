@@ -7,6 +7,8 @@ elseif(CONFIG_EXAMPLE_BUILD_IPERF_ETHERNET)
     set(project_path "examples/iperf_ethernet/")
 elseif(CONFIG_EXAMPLE_BUILD_RS485)
     set(project_path "examples/rs485/")
+elseif(CONFIG_EXAMPLE_BUILD_WIFI_HTTP_DOWNLOAD_FILE)
+    set(project_path "examples/wifi_http_download_file/")
 endif()
         
 idf_component_register(SRC_DIRS ${project_path} 

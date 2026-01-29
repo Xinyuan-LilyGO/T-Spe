@@ -11,5 +11,7 @@ menu "Example Configuration"
                 bool "iperf_ethernet"
             config EXAMPLE_BUILD_RS485
                 bool "rs485"
+            config EXAMPLE_BUILD_WIFI_HTTP_DOWNLOAD_FILE
+                bool "wifi_http_download_file"
     endchoice
 endmenu
