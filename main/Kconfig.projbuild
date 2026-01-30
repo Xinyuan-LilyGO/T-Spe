@@ -2,9 +2,9 @@ menu "Example Configuration"
 
     choice
         prompt "Select the example to build"
-        default EXAMPLE_BUILD_LAN8671
-            config EXAMPLE_BUILD_LAN8671
-                bool "lan8671"
+        default EXAMPLE_BUILD_ORIGINAL_TEST
+            config EXAMPLE_BUILD_ORIGINAL_TEST
+                bool "original_test"
             config EXAMPLE_BUILD_WIFI
                 bool "wifi"
             config EXAMPLE_BUILD_IPERF_ETHERNET
