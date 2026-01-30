@@ -2,7 +2,7 @@
  * @Description: None
  * @Author: LILYGO_L
  * @Date: 2026-01-29 17:59:59
- * @LastEditTime: 2026-01-30 11:37:22
+ * @LastEditTime: 2026-01-30 18:17:53
  * @License: GPL 3.0
  */
 #include "lilygo_device_driver_library.h"
@@ -86,20 +86,41 @@ void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id
 
 void wifi_download_test_task(void *pv)
 {
+    printf("wifi_download_test_task start\n");
+
+    printf("[wifi] reconnecting wifi for dns recovery...\n");
+    Wifi_Connect_Flag = false;
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    esp_wifi_connect();
+    // 等待WiFi重新连接
+    for (int i = 0; i < 10; i++)
+    {
+        if (Wifi_Connect_Flag == true)
+        {
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
     if (Wifi_Connect_Flag == false)
     {
         printf("wifi_download_test_task fail: wifi not connected\n");
-        vTaskDelete(Wifi_Download_Test_Task_Handle);
+
+        printf("[wifi] task completed\n");
+        Wifi_Download_Test_Task_Handle = nullptr;
+        vTaskDelete(NULL);
         return;
     }
-
-    printf("wifi_download_test_task start\n");
 
     esp_http_client_config_t config = {
         .url = DOWNLOAD_URL,
         .timeout_ms = 5000,
+        .disable_auto_redirect = false,
         .crt_bundle_attach = esp_crt_bundle_attach,
+        .keep_alive_enable = false, // 禁用长连接，确保完全关闭
     };
+
     esp_http_client_handle_t client = esp_http_client_init(&config);
 
     if (esp_http_client_open(client, 0) == ESP_OK)
@@ -107,7 +128,15 @@ void wifi_download_test_task(void *pv)
         esp_http_client_fetch_headers(client);
 
         auto buffer = std::make_unique<char[]>(WIFI_MAX_TRANSMIT_SIZE);
+
+        // 使用esp32内存分配
+        // auto buffer = std::unique_ptr<char[], std::function<void(char *)>>(
+        //     (char *)heap_caps_malloc(WIFI_MAX_TRANSMIT_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA),
+        //     [](char *p)
+        //     { heap_caps_free(p); });
+
         size_t total_size = 0, total_time_us = 0;
+        size_t bytes_this_time = 0;
         size_t start_wall_clock = esp_timer_get_time();
         size_t last_print_wall_clock = start_wall_clock;
 
@@ -119,6 +148,7 @@ void wifi_download_test_task(void *pv)
 
             if (read_len > 0)
             {
+                bytes_this_time += read_len;
                 total_size += read_len;
                 total_time_us += (t2 - t1);
             }
@@ -130,8 +160,11 @@ void wifi_download_test_task(void *pv)
             size_t now = esp_timer_get_time();
             if (now - last_print_wall_clock >= 1000000)
             {
-                double speed = (total_time_us > 0) ? (double)total_size / (total_time_us / 1000000.0) / 1024.0 : 0;
-                printf("[wifi] downloaded: %.2f kb | avg speed: %.2f kb/s\n", (double)total_size / 1024.0, speed);
+                float speed = (total_time_us > 0) ? (float)total_size / (total_time_us / 1000000.0) / 1024.0 : 0;
+                printf("[wifi] download size: %.2f kb | download speed: %.2f kb/s | total download size: %.2f kb\n",
+                       (float)bytes_this_time / 1024.0, speed, (float)total_size / 1024.0);
+
+                bytes_this_time = 0;
                 last_print_wall_clock = now;
             }
             if (now - start_wall_clock > 30000000)
@@ -141,15 +174,20 @@ void wifi_download_test_task(void *pv)
             }
         }
 
-        double total_time_s = total_time_us / 1000000.0;
+        float total_time_s = total_time_us / 1000000.0;
 
-        printf("[wifi] === finish result ===\n");
+        printf("[wifi] === result ===\n");
         printf("[wifi] total size: %.2f kb\n", total_size / 1024.0);
         printf("[wifi] total time %.3f s\n", total_time_s);
         printf("[wifi] avg speed: %.2f kb/s\n", (total_size / 1024.0) / total_time_s);
     }
+
+    esp_http_client_close(client);
     esp_http_client_cleanup(client);
-    vTaskDelete(Wifi_Download_Test_Task_Handle);
+
+    printf("[wifi] task completed\n");
+    Wifi_Download_Test_Task_Handle = nullptr;
+    vTaskDelete(NULL);
 }
 
 void eth_test_task(void *pv)
@@ -169,8 +207,10 @@ void eth_test_task(void *pv)
 
     uint8_t eth_port = 0;
     esp_eth_handle_t *eth_handle;
+    esp_eth_netif_glue_handle_t eth_netif_glues[1];
     ethernet_init_all(&eth_handle, &eth_port);
-    esp_netif_attach(eth_netif, esp_eth_new_netif_glue(eth_handle[0]));
+    eth_netif_glues[0] = esp_eth_new_netif_glue(eth_handle[0]);
+    esp_netif_attach(eth_netif, eth_netif_glues[0]);
     esp_eth_start(eth_handle[0]);
 
     // 等待链路稳定
@@ -180,7 +220,10 @@ void eth_test_task(void *pv)
     if (sock < 0)
     {
         printf("socket fail (errno: %d)\n", errno);
-        vTaskDelete(Eth_Test_Task_Handle);
+
+        printf("[eth] task completed\n");
+        Eth_Test_Task_Handle = nullptr;
+        vTaskDelete(NULL);
         return;
     }
 
@@ -196,12 +239,18 @@ void eth_test_task(void *pv)
 
     size_t total_size = 0;
     float total_time_s = 0;
-    size_t bytes_this_second = 0;
+    size_t bytes_this_time = 0;
     int64_t start_time = esp_timer_get_time();
     int64_t last_print_time = start_time;
     int64_t current_time = 0;
 
     auto buffer = std::make_unique<char[]>(ETH_MAX_TRANSMIT_SIZE);
+
+    // 使用esp32内存分配
+    // auto buffer = std::unique_ptr<char[], std::function<void(char *)>>(
+    //     (char *)heap_caps_malloc(ETH_MAX_TRANSMIT_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA),
+    //     [](char *p)
+    //     { heap_caps_free(p); });
 
     if (is_server)
     {
@@ -210,7 +259,10 @@ void eth_test_task(void *pv)
         {
             printf("bind fail (errno: %d)\n", errno);
             close(sock);
-            vTaskDelete(Eth_Test_Task_Handle);
+
+            printf("[eth] task completed\n");
+            Eth_Test_Task_Handle = nullptr;
+            vTaskDelete(NULL);
             return;
         }
         printf("[eth server] listening on port 5001...\n");
@@ -233,7 +285,7 @@ void eth_test_task(void *pv)
             {
                 if (validate_data("eth server", buffer.get(), len, 'A') == true)
                 {
-                    bytes_this_second += len;
+                    bytes_this_time += len;
                     total_size += len;
                 }
             }
@@ -244,20 +296,20 @@ void eth_test_task(void *pv)
                 float time_elapsed_sec = (float)(current_time - last_print_time) / 1000000.0f;
                 total_time_s += time_elapsed_sec;
 
-                float speed_kbps = (float)bytes_this_second / 1024.0f / time_elapsed_sec;
-                float speed_mbps = (float)bytes_this_second * 8.0f / 1024.0f / 1024.0f / time_elapsed_sec;
+                float speed_kbps = (float)bytes_this_time / 1024.0f / time_elapsed_sec;
+                float speed_mbps = (float)bytes_this_time * 8.0f / 1024.0f / 1024.0f / time_elapsed_sec;
 
-                printf("[eth server] receive: %.2f kb/s (%.2f mbps), receive size: %.2f kb, total receive size: %.2f kb\n",
-                       speed_kbps, speed_mbps, (float)bytes_this_second / 1024.0f, (float)total_size / 1024.0f);
+                printf("[eth server] receive size: %.2f kb | receive speed: %.2f kb/s (%.2f mbps) | total receive size: %.2f kb\n",
+                       (float)bytes_this_time / 1024.0f, speed_kbps, speed_mbps, (float)total_size / 1024.0f);
 
-                bytes_this_second = 0;
+                bytes_this_time = 0;
                 last_print_time = current_time;
             }
 
             vTaskDelay(pdMS_TO_TICKS(5));
         }
 
-        printf("[eth server] === finish result ===\n");
+        printf("[eth server] === result ===\n");
         printf("[eth server] total size: %.2f kb\n", total_size / 1024.0);
         printf("[eth server] total time %.3f s\n", total_time_s);
         printf("[eth server] avg speed: %.2f kb/s\n", (total_size / 1024.0) / total_time_s);
@@ -279,7 +331,7 @@ void eth_test_task(void *pv)
             }
             else
             {
-                bytes_this_second += len;
+                bytes_this_time += len;
                 total_size += len;
             }
 
@@ -290,27 +342,35 @@ void eth_test_task(void *pv)
                 float time_elapsed_sec = (float)(current_time - last_print_time) / 1000000.0f;
                 total_time_s += time_elapsed_sec;
 
-                float speed_kbps = (float)bytes_this_second / 1024.0f / time_elapsed_sec;
-                float speed_mbps = (float)bytes_this_second * 8.0f / 1024.0f / 1024.0f / time_elapsed_sec;
+                float speed_kbps = (float)bytes_this_time / 1024.0f / time_elapsed_sec;
+                float speed_mbps = (float)bytes_this_time * 8.0f / 1024.0f / 1024.0f / time_elapsed_sec;
 
-                printf("[eth client] send: %.2f kb/s (%.2f mbps), send size: %.2f kb, total send size: %.2f kb\n",
-                       speed_kbps, speed_mbps, (float)bytes_this_second / 1024.0f, (float)total_size / 1024.0f);
+                printf("[eth client] send size: %.2f kb | send speed: %.2f kb/s (%.2f mbps) | [eth client] total send size: %.2f kb\n",
+                       (float)bytes_this_time / 1024.0f, speed_kbps, speed_mbps, (float)total_size / 1024.0f);
 
-                bytes_this_second = 0;
+                bytes_this_time = 0;
                 last_print_time = current_time;
             }
 
             vTaskDelay(pdMS_TO_TICKS(5));
         }
 
-        printf("[eth client] === finish result ===\n");
+        printf("[eth client] === result ===\n");
         printf("[eth client] total size: %.2f kb\n", total_size / 1024.0);
         printf("[eth client] total time %.3f s\n", total_time_s);
         printf("[eth client] avg speed: %.2f kb/s\n", (total_size / 1024.0) / total_time_s);
     }
 
     close(sock);
-    vTaskDelete(Eth_Test_Task_Handle);
+
+    esp_eth_stop(eth_handle[0]);
+    esp_eth_del_netif_glue(eth_netif_glues[0]);
+    esp_netif_destroy(eth_netif);
+    ethernet_deinit_all(eth_handle);
+
+    printf("[eth] task completed\n");
+    Eth_Test_Task_Handle = nullptr;
+    vTaskDelete(NULL);
 }
 
 void rs485_test_task(void *pv)
@@ -319,6 +379,7 @@ void rs485_test_task(void *pv)
     printf("rs485_test_task (%s) start\n", is_send ? "send" : "receive");
 
     size_t total_size = 0, total_time_us = 0;
+    size_t bytes_this_time = 0;
     size_t last_print_wall_clock = esp_timer_get_time();
 
     if (is_send == true)
@@ -327,21 +388,34 @@ void rs485_test_task(void *pv)
         while (All_Exit_Test_Flag == false)
         {
             size_t t1 = esp_timer_get_time();
-            Uart_Bus->write(payload.data(), payload.size());
+            int32_t len = Uart_Bus->write(payload.data(), payload.size());
             size_t t2 = esp_timer_get_time();
 
-            total_size += payload.size();
+            bytes_this_time += len;
+            total_size += len;
             total_time_us += (t2 - t1);
 
             size_t now = esp_timer_get_time();
-            if (now - last_print_wall_clock >= 1000000)
+            if (now - last_print_wall_clock >= 3000000)
             {
-                double speed = (total_time_us > 0) ? (double)total_size / (total_time_us / 1000000.0) / 1024.0 : 0;
-                printf("[rs485 send] speed: %.2f kb/s\n", speed);
+                float speed_kbps = (float)bytes_this_time / 1024.0f / ((float)(now - last_print_wall_clock) / 1000000.0);
+
+                printf("[rs485 send] send size: %.2f kb | send speed: %.2f kb/s | total send size: %.2f kb \n",
+                       (float)bytes_this_time / 1024.0, speed_kbps, (float)total_size / 1024.0);
+
+                bytes_this_time = 0;
                 last_print_wall_clock = now;
             }
+
             vTaskDelay(pdMS_TO_TICKS(10));
         }
+
+        float total_time_s = total_time_us / 1000000.0;
+
+        printf("[rs485 send] === result ===\n");
+        printf("[rs485 send] total size: %.2f kb\n", (float)total_size / 1024.0);
+        printf("[rs485 send] total time %.3f s\n", total_time_s);
+        printf("[rs485 send] avg speed: %.2f kb/s\n", ((float)total_size / 1024.0) / total_time_s);
     }
     else
     {
@@ -350,39 +424,52 @@ void rs485_test_task(void *pv)
             size_t len = Uart_Bus->get_rx_buffer_length();
             if (len > 0)
             {
-                auto rx_buf = std::make_unique<char[]>(len);
+                auto buffer = std::make_unique<char[]>(len);
+
+                // 使用esp32内存分配
+                // auto buffer = std::unique_ptr<char[], std::function<void(char *)>>(
+                //     (char *)heap_caps_malloc(len, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA),
+                //     [](char *p)
+                //     { heap_caps_free(p); });
+
                 size_t t1 = esp_timer_get_time();
-                Uart_Bus->read(rx_buf.get(), len);
+                Uart_Bus->read(buffer.get(), len);
                 size_t t2 = esp_timer_get_time();
 
-                if (validate_data("rs485 receive", rx_buf.get(), len, 'D') == false)
+                if (validate_data("rs485 receive", buffer.get(), len, 'D') == true)
                 {
-                    printf("[rs485 receive] send fail (error: validate_data fail)\n");
-                    break;
+                    bytes_this_time += len;
+                    total_size += len;
+                    total_time_us += (t2 - t1);
                 }
-
-                total_size += len;
-                total_time_us += (t2 - t1);
             }
 
             size_t now = esp_timer_get_time();
-            if (now - last_print_wall_clock >= 1000000)
+            if (now - last_print_wall_clock >= 3000000)
             {
-                double speed = (total_time_us > 0) ? (double)total_size / (total_time_us / 1000000.0) / 1024.0 : 0;
-                printf("[rs485 receive] speed: %.2f kb/s\n", speed);
+                float speed_kbps = (float)bytes_this_time / 1024.0f / ((float)(now - last_print_wall_clock) / 1000000.0);
+
+                printf("[rs485 receive] receive size: %.2f kb | receive speed: %.2f kb/s | total receive size: %.2f kb \n",
+                       (float)bytes_this_time / 1024.0, speed_kbps, (float)total_size / 1024.0);
+
+                bytes_this_time = 0;
                 last_print_wall_clock = now;
             }
+
             vTaskDelay(pdMS_TO_TICKS(10));
         }
+
+        float total_time_s = total_time_us / 1000000.0;
+
+        printf("[rs485 receive] === result ===\n");
+        printf("[rs485 receive] total size: %.2f kb\n", (float)total_size / 1024.0);
+        printf("[rs485 receive] total time %.3f s\n", total_time_s);
+        printf("[rs485 receive] avg speed: %.2f kb/s\n", ((float)total_size / 1024.0) / total_time_s);
     }
-    double total_time_s = total_time_us / 1000000.0;
 
-    printf("[rs485] === finish result ===\n");
-    printf("[rs485] total size: %.2f kb\n", total_size / 1024.0);
-    printf("[rs485] total time %.3f s\n", total_time_s);
-    printf("[rs485] avg speed: %.2f kb/s\n", (total_size / 1024.0) / total_time_s);
-
-    vTaskDelete(Rs485_Test_Task_Handle);
+    printf("[rs485] task completed\n");
+    Rs485_Test_Task_Handle = nullptr;
+    vTaskDelete(NULL);
 }
 
 bool parse_cmd(std::vector<std::string> cmd)
@@ -554,6 +641,13 @@ bool parse_cmd(std::vector<std::string> cmd)
         }
     }
 
+    printf("parse_cmd fail (unknown command)\n");
+    printf("operation command:\n");
+    printf("[all_exit:]\n");
+    printf("[wifi:]\n");
+    printf("[eth:server:] or [eth:client:]\n");
+    printf("[rs485:send:] or [rs485:receive:]\n");
+
     return false;
 }
 
@@ -577,30 +671,32 @@ extern "C" void app_main(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    // esp_netif_create_default_wifi_sta();
-    // wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    // esp_wifi_init(&cfg);
-    // esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL);
-    // esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL);
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+    assert(sta_netif);
 
-    // esp_wifi_set_mode(WIFI_MODE_STA);
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL);
+    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL);
 
-    // wifi_config_t wifi_config =
-    //     {
-    //         .sta =
-    //             {
-    //                 .ssid = WIFI_SSID,
-    //                 .password = WIFI_PASSWORD,
-    //             },
-    //     };
-    // esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-    // esp_wifi_start();
+    esp_wifi_set_mode(WIFI_MODE_STA);
+
+    wifi_config_t wifi_config =
+        {
+            .sta =
+                {
+                    .ssid = WIFI_SSID,
+                    .password = WIFI_PASSWORD,
+                },
+        };
+    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
+    esp_wifi_start();
 
     uart_driver_install(UART_NUM_0, 2048, 0, 0, NULL, 0);
 
-    vTaskDelay(pdMS_TO_TICKS(100));
+    vTaskDelay(pdMS_TO_TICKS(500));
 
-    printf("cmd:\n");
+    printf("operation command:\n");
     printf("[all_exit:]\n");
     printf("[wifi:]\n");
     printf("[eth:server:] or [eth:client:]\n");
@@ -613,6 +709,13 @@ extern "C" void app_main(void)
         if (uart_len > 0)
         {
             auto buffer = std::make_unique<char[]>(uart_len + 1);
+
+            // 使用esp32内存分配
+            // auto buffer = std::unique_ptr<char[], std::function<void(char *)>>(
+            //     (char *)heap_caps_malloc(uart_len + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA),
+            //     [](char *p)
+            //     { heap_caps_free(p); });
+
             int read_len = uart_read_bytes(UART_NUM_0, buffer.get(), uart_len, pdMS_TO_TICKS(20));
             buffer[read_len] = '\0';
             std::string content(buffer.get());
@@ -625,14 +728,7 @@ extern "C" void app_main(void)
                 parts.push_back(token);
             }
 
-            if (parse_cmd(parts) == true)
-            {
-                printf("parse_cmd success\n");
-            }
-            else
-            {
-                printf("parse_cmd fail\n");
-            }
+            parse_cmd(parts);
         }
 
         vTaskDelay(pdMS_TO_TICKS(10));
