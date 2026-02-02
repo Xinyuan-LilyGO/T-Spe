@@ -2,7 +2,7 @@
  * @Description: None
  * @Author: LILYGO_L
  * @Date: 2026-01-29 17:59:59
- * @LastEditTime: 2026-01-30 18:17:53
+ * @LastEditTime: 2026-02-02 10:26:55
  * @License: GPL 3.0
  */
 #include "lilygo_device_driver_library.h"
@@ -202,7 +202,7 @@ void eth_test_task(void *pv)
     esp_netif_ip_info_t ip_info;
     ip_info.ip.addr = ESP_IP4TOADDR(192, 168, 0, (is_server ? 1 : 2));
     ip_info.netmask.addr = ESP_IP4TOADDR(255, 255, 255, 0);
-    ip_info.gw.addr = ESP_IP4TOADDR(192, 168, 0, 1);
+    ip_info.gw.addr = ESP_IP4TOADDR(0, 0, 0, 0);
     esp_netif_set_ip_info(eth_netif, &ip_info);
 
     uint8_t eth_port = 0;
