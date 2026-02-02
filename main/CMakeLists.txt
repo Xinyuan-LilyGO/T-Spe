@@ -1,6 +1,6 @@
 #这里选择你需要编译的项目
-if(CONFIG_EXAMPLE_BUILD_ORIGINAL_TEST)
-    set(project_path "examples/original_test/")
+if(CONFIG_EXAMPLE_BUILD_GENERAL_TEST)
+    set(project_path "examples/general_test/")
 elseif(CONFIG_EXAMPLE_BUILD_WIFI)
     set(project_path "examples/wifi/")
 elseif(CONFIG_EXAMPLE_BUILD_IPERF_ETHERNET)

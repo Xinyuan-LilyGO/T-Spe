@@ -2,7 +2,7 @@
  * @Description: None
  * @Author: LILYGO_L
  * @Date: 2026-01-29 17:59:59
- * @LastEditTime: 2026-02-02 10:26:55
+ * @LastEditTime: 2026-02-02 10:42:04
  * @License: GPL 3.0
  */
 #include "lilygo_device_driver_library.h"
@@ -20,6 +20,10 @@
 #include <vector>
 #include <string>
 #include <sstream>
+
+#define SOFTWARE_NAME "general_test"
+#define SOFTWARE_LASTEDITTIME "202602021036"
+#define BOARD_VERSION "v1.0"
 
 #define WIFI_SSID "xinyuandianzi"
 #define WIFI_PASSWORD "AA15994823428"
@@ -654,6 +658,9 @@ bool parse_cmd(std::vector<std::string> cmd)
 extern "C" void app_main(void)
 {
     printf("Ciallo\n");
+    std::stringstream ss;
+    ss << "[T-Spe_" << BOARD_VERSION << "][" << SOFTWARE_NAME << "]_firmware_" << SOFTWARE_LASTEDITTIME << "\n";
+    printf("%s", ss.str().c_str());
 
     ESP32->pin_mode(GPIO0_50MHZ_SWITCH, Cpp_Bus_Driver::Tool::Pin_Mode::OUTPUT);
     ESP32->pin_mode(LAN8671_WAKE_UP, Cpp_Bus_Driver::Tool::Pin_Mode::OUTPUT);
