@@ -2,7 +2,7 @@
  * @Description: None
  * @Author: LILYGO_L
  * @Date: 2026-01-26 09:31:39
- * @LastEditTime: 2026-03-13 16:43:01
+ * @LastEditTime: 2026-03-13 16:49:27
  * @License: GPL 3.0
 -->
 
@@ -126,7 +126,7 @@ T-Spe is a compact controller board specifically designed for industrial multi-n
 3. Burn the file in the root directory of the project file "[firmware](./firmware/)" file,There is a description of the firmware file version inside, just choose the appropriate version to download.
 
 <p align="center" width="100%">
-    <img src="image/10.png" alt="example">
+    <img src="image/3.jpg" alt="example">
     <img src="image/11.png" alt="example">
 </p>
 
