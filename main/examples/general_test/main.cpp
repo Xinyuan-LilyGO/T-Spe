@@ -2,7 +2,7 @@
  * @Description: None
  * @Author: LILYGO_L
  * @Date: 2026-01-29 17:59:59
- * @LastEditTime: 2026-02-02 10:42:04
+ * @LastEditTime: 2026-03-13 11:13:28
  * @License: GPL 3.0
  */
 #include "lilygo_device_driver_library.h"
@@ -22,7 +22,7 @@
 #include <sstream>
 
 #define SOFTWARE_NAME "general_test"
-#define SOFTWARE_LASTEDITTIME "202602021036"
+#define SOFTWARE_LASTEDITTIME "202603131113"
 #define BOARD_VERSION "v1.0"
 
 #define WIFI_SSID "xinyuandianzi"
@@ -41,7 +41,7 @@ TaskHandle_t Wifi_Download_Test_Task_Handle = nullptr;
 TaskHandle_t Eth_Test_Task_Handle = nullptr;
 TaskHandle_t Rs485_Test_Task_Handle = nullptr;
 
-auto Uart_Bus = std::make_shared<Cpp_Bus_Driver::Hardware_Uart>(RS485_RX, RS485_TX, UART_NUM_1);
+auto Uart_Bus = std::make_shared<Cpp_Bus_Driver::Hardware_Uart>(TD301D485H_A_TX, TD301D485H_A_RX, -1, -1, UART_NUM_1);
 auto ESP32 = std::make_unique<Cpp_Bus_Driver::Tool>();
 
 bool validate_data(const char *tag, const char *data, size_t len, char expected_char)
