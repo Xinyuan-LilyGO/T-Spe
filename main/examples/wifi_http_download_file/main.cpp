@@ -1,12 +1,10 @@
 /*
- * @Description: None
+ * @Description: wifi_http_download_file
  * @Author: LILYGO_L
  * @Date: 2026-01-28 15:50:33
- * @LastEditTime: 2026-01-29 09:16:36
+ * @LastEditTime: 2026-03-13 16:37:56
  * @License: GPL 3.0
  */
-
-#include "sdkconfig.h"
 #include "lilygo_device_driver_library.h"
 #include "cpp_bus_driver_library.h"
 #include "esp_event.h"

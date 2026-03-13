@@ -1,11 +1,10 @@
 /*
- * @Description: iic_scan
+ * @Description: rs485
  * @Author: LILYGO_L
- * @Date: 2025-06-13 12:06:14
- * @LastEditTime: 2026-03-13 11:06:56
+ * @Date: 2026-01-28 11:26:38
+ * @LastEditTime: 2026-03-13 16:37:33
  * @License: GPL 3.0
  */
-#include "sdkconfig.h"
 #include "lilygo_device_driver_library.h"
 #include "cpp_bus_driver_library.h"
 

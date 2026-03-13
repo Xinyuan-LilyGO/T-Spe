@@ -1,8 +1,8 @@
 /*
- * @Description: None
+ * @Description: wifi
  * @Author: LILYGO_L
  * @Date: 2026-01-26 13:59:19
- * @LastEditTime: 2026-01-26 14:27:51
+ * @LastEditTime: 2026-03-13 16:37:48
  * @License: GPL 3.0
  */
 
@@ -11,7 +11,6 @@
 #include "freertos/task.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
-#include "sdkconfig.h"
 #include "cpp_bus_driver_library.h"
 #include "esp_event.h"
 #include "esp_wifi_remote.h"
