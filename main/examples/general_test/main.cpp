@@ -2,7 +2,7 @@
  * @Description: general_test
  * @Author: LILYGO_L
  * @Date: 2026-01-29 17:59:59
- * @LastEditTime: 2026-03-13 16:37:16
+ * @LastEditTime: 2026-06-03 15:44:11
  * @License: GPL 3.0
  */
 #include "lilygo_device_driver_library.h"
@@ -10,32 +10,38 @@
 #include "nvs_flash.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
-#include "esp_http_client.h"
-#include "esp_crt_bundle.h"
 #include "esp_netif.h"
 #include "esp_eth.h"
 #include "lwip/sockets.h"
 #include "ethernet_init.h"
 #include "esp_timer.h"
+#include "esp_app_desc.h"
+#include "esp_sntp.h"
 #include <vector>
 #include <string>
 #include <sstream>
+#include <time.h>
+#include <sys/time.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define SOFTWARE_NAME "general_test"
-#define SOFTWARE_LASTEDITTIME "202603131113"
 #define BOARD_VERSION "v1.0"
 
-#define WIFI_SSID "xinyuandianzi"
-#define WIFI_PASSWORD "AA15994823428"
+#define WIFI_SSID "LilyGo-AABB"
+#define WIFI_PASSWORD "xinyuandianzi"
 
-#define DOWNLOAD_URL "https://cd001.www.duba.net/duba/install/packages/ever/kinsthomeui_150_15.exe"
+#define WIFI_TIME_SYNC_TIMEOUT_MS 15000
+#define WIFI_TIMEZONE "CST-8"
+#define WIFI_NTP_SERVER_0 "ntp.aliyun.com"
 
-#define WIFI_MAX_TRANSMIT_SIZE 1024 * 4
 #define ETH_MAX_TRANSMIT_SIZE 1024 * 5
 #define RS485_MAX_TRANSMIT_SIZE 1024
 
 bool Wifi_Connect_Flag = false;
 bool All_Exit_Test_Flag = false;
+bool Wifi_Time_Sntp_Start_Flag = false;
+volatile bool Wifi_Time_Sync_Flag = false;
 
 TaskHandle_t Wifi_Download_Test_Task_Handle = nullptr;
 TaskHandle_t Eth_Test_Task_Handle = nullptr;
@@ -43,6 +49,75 @@ TaskHandle_t Rs485_Test_Task_Handle = nullptr;
 
 auto Uart_Bus = std::make_shared<Cpp_Bus_Driver::Hardware_Uart>(TD301D485H_A_TX, TD301D485H_A_RX, -1, -1, UART_NUM_1);
 auto ESP32 = std::make_unique<Cpp_Bus_Driver::Tool>();
+
+static int get_build_month(const char *date)
+{
+    static constexpr char month_names[][4] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    };
+
+    for (int i = 0; i < 12; i++)
+    {
+        if (date[0] == month_names[i][0] && date[1] == month_names[i][1] && date[2] == month_names[i][2])
+        {
+            return i + 1;
+        }
+    }
+
+    return 0;
+}
+
+static std::string get_software_build_time()
+{
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    const char *date = app_desc->date;
+    const char *time = app_desc->time;
+    int month = get_build_month(date);
+
+    char build_time[13] = {
+        date[7],
+        date[8],
+        date[9],
+        date[10],
+        static_cast<char>('0' + month / 10),
+        static_cast<char>('0' + month % 10),
+        date[4] == ' ' ? '0' : date[4],
+        date[5],
+        time[0],
+        time[1],
+        time[3],
+        time[4],
+        '\0',
+    };
+
+    return std::string(build_time);
+}
+
+static void print_wifi_time()
+{
+    time_t now = 0;
+    struct tm timeinfo = {};
+    char time_buf[64] = {};
+
+    time(&now);
+
+    setenv("TZ", WIFI_TIMEZONE, 1);
+    tzset();
+    localtime_r(&now, &timeinfo);
+    strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    printf("[wifi] local time: %s\n", time_buf);
+
+    gmtime_r(&now, &timeinfo);
+    strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &timeinfo);
+    printf("[wifi] utc time: %s\n", time_buf);
+}
+
+static void wifi_time_sync_notification_cb(struct timeval *tv)
+{
+    (void)tv;
+    Wifi_Time_Sync_Flag = true;
+}
 
 bool validate_data(const char *tag, const char *data, size_t len, char expected_char)
 {
@@ -88,11 +163,11 @@ void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id
     }
 }
 
-void wifi_download_test_task(void *pv)
+void wifi_time_test_task(void *pv)
 {
-    printf("wifi_download_test_task start\n");
+    printf("wifi_time_test_task start\n");
 
-    printf("[wifi] reconnecting wifi for dns recovery...\n");
+    printf("[wifi] preparing wifi time sync...\n");
     Wifi_Connect_Flag = false;
     esp_wifi_disconnect();
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -109,7 +184,7 @@ void wifi_download_test_task(void *pv)
 
     if (Wifi_Connect_Flag == false)
     {
-        printf("wifi_download_test_task fail: wifi not connected\n");
+        printf("wifi_time_test_task fail: wifi not connected\n");
 
         printf("[wifi] task completed\n");
         Wifi_Download_Test_Task_Handle = nullptr;
@@ -117,77 +192,39 @@ void wifi_download_test_task(void *pv)
         return;
     }
 
-    esp_http_client_config_t config = {
-        .url = DOWNLOAD_URL,
-        .timeout_ms = 5000,
-        .disable_auto_redirect = false,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-        .keep_alive_enable = false, // 禁用长连接，确保完全关闭
-    };
 
-    esp_http_client_handle_t client = esp_http_client_init(&config);
-
-    if (esp_http_client_open(client, 0) == ESP_OK)
+    printf("[wifi] syncing time by SNTP...\n");
+    printf("[wifi] ntp server: %s\n", WIFI_NTP_SERVER_0);
+    Wifi_Time_Sync_Flag = false;
+    if (Wifi_Time_Sntp_Start_Flag == true)
     {
-        esp_http_client_fetch_headers(client);
-
-        auto buffer = std::make_unique<char[]>(WIFI_MAX_TRANSMIT_SIZE);
-
-        // 使用esp32内存分配
-        // auto buffer = std::unique_ptr<char[], std::function<void(char *)>>(
-        //     (char *)heap_caps_malloc(WIFI_MAX_TRANSMIT_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA),
-        //     [](char *p)
-        //     { heap_caps_free(p); });
-
-        size_t total_size = 0, total_time_us = 0;
-        size_t bytes_this_time = 0;
-        size_t start_wall_clock = esp_timer_get_time();
-        size_t last_print_wall_clock = start_wall_clock;
-
-        while (All_Exit_Test_Flag == false)
-        {
-            size_t t1 = esp_timer_get_time();
-            int read_len = esp_http_client_read(client, buffer.get(), WIFI_MAX_TRANSMIT_SIZE);
-            size_t t2 = esp_timer_get_time();
-
-            if (read_len > 0)
-            {
-                bytes_this_time += read_len;
-                total_size += read_len;
-                total_time_us += (t2 - t1);
-            }
-            else
-            {
-                break;
-            }
-
-            size_t now = esp_timer_get_time();
-            if (now - last_print_wall_clock >= 1000000)
-            {
-                float speed = (total_time_us > 0) ? (float)total_size / (total_time_us / 1000000.0) / 1024.0 : 0;
-                printf("[wifi] download size: %.2f kb | download speed: %.2f kb/s | total download size: %.2f kb\n",
-                       (float)bytes_this_time / 1024.0, speed, (float)total_size / 1024.0);
-
-                bytes_this_time = 0;
-                last_print_wall_clock = now;
-            }
-            if (now - start_wall_clock > 30000000)
-            {
-                printf("[wifi] 30s time limit reached\n");
-                break;
-            }
-        }
-
-        float total_time_s = total_time_us / 1000000.0;
-
-        printf("[wifi] === result ===\n");
-        printf("[wifi] total size: %.2f kb\n", total_size / 1024.0);
-        printf("[wifi] total time %.3f s\n", total_time_s);
-        printf("[wifi] avg speed: %.2f kb/s\n", (total_size / 1024.0) / total_time_s);
+        esp_sntp_stop();
+        Wifi_Time_Sntp_Start_Flag = false;
     }
 
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, WIFI_NTP_SERVER_0);
+    esp_sntp_set_time_sync_notification_cb(wifi_time_sync_notification_cb);
+    esp_sntp_init();
+    Wifi_Time_Sntp_Start_Flag = true;
+
+    int64_t sync_start_time = esp_timer_get_time();
+    while (Wifi_Time_Sync_Flag == false && (esp_timer_get_time() - sync_start_time) < (WIFI_TIME_SYNC_TIMEOUT_MS * 1000))
+    {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    if (Wifi_Time_Sync_Flag == true)
+    {
+        print_wifi_time();
+    }
+    else
+    {
+        printf("[wifi] time sync timeout\n");
+    }
+
+    esp_sntp_stop();
+    Wifi_Time_Sntp_Start_Flag = false;
 
     printf("[wifi] task completed\n");
     Wifi_Download_Test_Task_Handle = nullptr;
@@ -496,7 +533,7 @@ bool parse_cmd(std::vector<std::string> cmd)
         {
             All_Exit_Test_Flag = false;
 
-            xTaskCreate(wifi_download_test_task, "wifi_task", 1024 * 8, NULL, 5, &Wifi_Download_Test_Task_Handle);
+            xTaskCreate(wifi_time_test_task, "wifi_task", 1024 * 8, NULL, 5, &Wifi_Download_Test_Task_Handle);
             return true;
         }
         else
@@ -506,12 +543,12 @@ bool parse_cmd(std::vector<std::string> cmd)
             {
                 All_Exit_Test_Flag = false;
 
-                xTaskCreate(wifi_download_test_task, "wifi_task", 1024 * 8, NULL, 5, &Wifi_Download_Test_Task_Handle);
+                xTaskCreate(wifi_time_test_task, "wifi_task", 1024 * 8, NULL, 5, &Wifi_Download_Test_Task_Handle);
                 return true;
             }
             else
             {
-                printf("wifi_download_test_task create fail (status: %d)\n", status);
+                printf("wifi_time_test_task create fail (status: %d)\n", status);
                 return false;
             }
         }
@@ -659,7 +696,7 @@ extern "C" void app_main(void)
 {
     printf("Ciallo\n");
     std::stringstream ss;
-    ss << "[T-Spe_" << BOARD_VERSION << "][" << SOFTWARE_NAME << "]_firmware_" << SOFTWARE_LASTEDITTIME << "\n";
+    ss << "[T-Spe_" << BOARD_VERSION << "][" << SOFTWARE_NAME << "]_firmware_" << get_software_build_time() << "\n";
     printf("%s", ss.str().c_str());
 
     ESP32->pin_mode(GPIO0_50MHZ_SWITCH, Cpp_Bus_Driver::Tool::Pin_Mode::OUTPUT);
@@ -688,14 +725,9 @@ extern "C" void app_main(void)
 
     esp_wifi_set_mode(WIFI_MODE_STA);
 
-    wifi_config_t wifi_config =
-        {
-            .sta =
-                {
-                    .ssid = WIFI_SSID,
-                    .password = WIFI_PASSWORD,
-                },
-        };
+    wifi_config_t wifi_config = {};
+    strncpy((char *)wifi_config.sta.ssid, WIFI_SSID, sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char *)wifi_config.sta.password, WIFI_PASSWORD, sizeof(wifi_config.sta.password) - 1);
     esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
     esp_wifi_start();
 

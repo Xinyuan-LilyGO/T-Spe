@@ -12,4 +12,16 @@ elseif(CONFIG_EXAMPLE_BUILD_WIFI_HTTP_DOWNLOAD_FILE)
 endif()
         
 idf_component_register(SRC_DIRS ${project_path} 
-                        INCLUDE_DIRS ${project_path})
+                        INCLUDE_DIRS ${project_path}
+                        PRIV_REQUIRES
+                        lilygo_device_driver
+                        cpp_bus_driver
+                        nvs_flash
+                        esp_wifi
+                        esp_event
+                        esp_netif
+                        esp_eth
+                        lwip
+                        ethernet_init
+                        esp_timer
+                        esp_app_format)
