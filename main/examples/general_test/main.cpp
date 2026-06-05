@@ -42,6 +42,13 @@
 #define WIFI_NTP_SERVER_0 "ntp.aliyun.com"
 
 #define ETH_MAX_TRANSMIT_SIZE 1400
+#define ETH_SERVER_PORT 5001
+#define ETH_CLIENT_PORT 5002
+#define ETH_TEST_HEADER_SIZE 16
+#define ETH_ERROR_SNIPPET_BYTES 24
+#define ETH_MISMATCH_PRINT_LIMIT 8
+#define ETH_IGNORED_ENDPOINT_PRINT_LIMIT 3
+#define ETH_IGNORED_ENDPOINT_PRINT_INTERVAL 16
 #define ETH_TASK_LOOP_DELAY_MS 2
 #define ETH_SEND_BACKOFF_DELAY_MS 20
 #define ETH_START_WAIT_MS 2000
@@ -59,6 +66,21 @@ TaskHandle_t Rs485_Test_Task_Handle = nullptr;
 
 auto Uart_Bus = std::make_shared<Cpp_Bus_Driver::Hardware_Uart>(TD301D485H_A_TX, TD301D485H_A_RX, -1, -1, UART_NUM_1);
 auto ESP32 = std::make_unique<Cpp_Bus_Driver::Tool>();
+
+struct EthPacketStats
+{
+    size_t packet_count = 0;
+    size_t bad_packet_count = 0;
+    size_t ignored_packet_count = 0;
+    size_t source_error_count = 0;
+    size_t length_error_count = 0;
+    size_t magic_error_count = 0;
+    size_t sequence_error_count = 0;
+    size_t payload_error_count = 0;
+    size_t checksum_error_count = 0;
+    bool sequence_valid = false;
+    uint32_t expected_sequence = 0;
+};
 
 static int get_build_month(const char *date)
 {
@@ -152,6 +174,293 @@ bool validate_data(const char *tag, const char *data, size_t len, char expected_
             return false;
         }
     }
+    return true;
+}
+
+static void write_u16_le(char *data, uint16_t value)
+{
+    data[0] = static_cast<char>(value & 0xFF);
+    data[1] = static_cast<char>((value >> 8) & 0xFF);
+}
+
+static uint16_t read_u16_le(const char *data)
+{
+    return static_cast<uint16_t>(static_cast<uint8_t>(data[0])) |
+           (static_cast<uint16_t>(static_cast<uint8_t>(data[1])) << 8);
+}
+
+static void write_u32_le(char *data, uint32_t value)
+{
+    data[0] = static_cast<char>(value & 0xFF);
+    data[1] = static_cast<char>((value >> 8) & 0xFF);
+    data[2] = static_cast<char>((value >> 16) & 0xFF);
+    data[3] = static_cast<char>((value >> 24) & 0xFF);
+}
+
+static uint32_t read_u32_le(const char *data)
+{
+    return static_cast<uint32_t>(static_cast<uint8_t>(data[0])) |
+           (static_cast<uint32_t>(static_cast<uint8_t>(data[1])) << 8) |
+           (static_cast<uint32_t>(static_cast<uint8_t>(data[2])) << 16) |
+           (static_cast<uint32_t>(static_cast<uint8_t>(data[3])) << 24);
+}
+
+static uint8_t eth_expected_payload_byte(uint32_t sequence, size_t payload_offset)
+{
+    return static_cast<uint8_t>('A' + ((sequence + payload_offset) % 26));
+}
+
+static uint32_t eth_calc_checksum(const char *data, size_t len)
+{
+    uint32_t checksum = 2166136261u;
+    for (size_t i = 0; i < len; i++)
+    {
+        checksum ^= static_cast<uint8_t>(data[i]);
+        checksum *= 16777619u;
+    }
+
+    return checksum;
+}
+
+static void eth_build_test_packet(char *data, size_t len, uint32_t sequence)
+{
+    if (len < ETH_TEST_HEADER_SIZE)
+    {
+        return;
+    }
+
+    size_t payload_len = len - ETH_TEST_HEADER_SIZE;
+
+    data[0] = 'T';
+    data[1] = 'S';
+    data[2] = 'P';
+    data[3] = 'E';
+    write_u32_le(&data[4], sequence);
+    write_u16_le(&data[8], static_cast<uint16_t>(payload_len));
+    write_u16_le(&data[10], ETH_TEST_HEADER_SIZE);
+
+    char *payload = data + ETH_TEST_HEADER_SIZE;
+    for (size_t i = 0; i < payload_len; i++)
+    {
+        payload[i] = static_cast<char>(eth_expected_payload_byte(sequence, i));
+    }
+
+    write_u32_le(&data[12], eth_calc_checksum(payload, payload_len));
+}
+
+static void eth_format_ipv4(uint32_t network_addr, char *buffer, size_t buffer_len)
+{
+    uint32_t host_addr = ntohl(network_addr);
+    snprintf(buffer, buffer_len, "%lu.%lu.%lu.%lu",
+             static_cast<unsigned long>((host_addr >> 24) & 0xFF),
+             static_cast<unsigned long>((host_addr >> 16) & 0xFF),
+             static_cast<unsigned long>((host_addr >> 8) & 0xFF),
+             static_cast<unsigned long>(host_addr & 0xFF));
+}
+
+static bool eth_is_expected_client_endpoint(const struct sockaddr_in *source_addr)
+{
+    uint32_t host_addr = ntohl(source_addr->sin_addr.s_addr);
+    uint32_t expected_addr = (192UL << 24) | (168UL << 16) | (0UL << 8) | 2UL;
+    return host_addr == expected_addr && ntohs(source_addr->sin_port) == ETH_CLIENT_PORT;
+}
+
+static void eth_print_hex_bytes(const char *tag, const char *label, const char *data, size_t len, size_t max_len)
+{
+    size_t print_len = (len < max_len) ? len : max_len;
+
+    printf("[%s] %s:", tag, label);
+    for (size_t i = 0; i < print_len; i++)
+    {
+        printf(" %#X", static_cast<unsigned int>(static_cast<uint8_t>(data[i])));
+    }
+    if (len > print_len)
+    {
+        printf(" ...");
+    }
+    printf("\n");
+}
+
+static void eth_print_packet_context(const char *reason, const char *data, size_t len,
+                                     const struct sockaddr_in *source_addr, const EthPacketStats *stats)
+{
+    char source_ip[16] = {};
+    eth_format_ipv4(source_addr->sin_addr.s_addr, source_ip, sizeof(source_ip));
+
+    printf("\n[eth server] !!! packet check fail !!!\n");
+    printf("[eth server] reason: %s\n", reason);
+    printf("[eth server] packet count: %zu | bad packets: %zu\n",
+           stats->packet_count, stats->bad_packet_count);
+    printf("[eth server] source: %s:%u | len: %zu bytes | expected len: %u bytes\n",
+           source_ip, static_cast<unsigned int>(ntohs(source_addr->sin_port)), len,
+           static_cast<unsigned int>(ETH_MAX_TRANSMIT_SIZE));
+
+    if (len > 0)
+    {
+        eth_print_hex_bytes("eth server", "first bytes", data, len, ETH_ERROR_SNIPPET_BYTES);
+        if (len > ETH_ERROR_SNIPPET_BYTES)
+        {
+            size_t tail_len = (len < ETH_ERROR_SNIPPET_BYTES) ? len : ETH_ERROR_SNIPPET_BYTES;
+            eth_print_hex_bytes("eth server", "last bytes", data + len - tail_len, tail_len, tail_len);
+        }
+    }
+}
+
+static bool eth_validate_test_packet(const char *data, size_t len,
+                                     const struct sockaddr_in *source_addr, EthPacketStats *stats)
+{
+    stats->packet_count++;
+
+    if (eth_is_expected_client_endpoint(source_addr) == false)
+    {
+        stats->ignored_packet_count++;
+        stats->source_error_count++;
+        if (stats->source_error_count <= ETH_IGNORED_ENDPOINT_PRINT_LIMIT ||
+            (stats->source_error_count % ETH_IGNORED_ENDPOINT_PRINT_INTERVAL) == 0)
+        {
+            char source_ip[16] = {};
+            eth_format_ipv4(source_addr->sin_addr.s_addr, source_ip, sizeof(source_ip));
+
+            printf("\n[eth server] --- ignored packet ---\n");
+            printf("[eth server] reason: unexpected source endpoint\n");
+            printf("[eth server] source: %s:%u | len: %zu bytes | expected source: 192.168.0.2:%u\n",
+                   source_ip, static_cast<unsigned int>(ntohs(source_addr->sin_port)), len,
+                   static_cast<unsigned int>(ETH_CLIENT_PORT));
+            printf("[eth server] packet count: %zu | ignored packets: %zu\n",
+                   stats->packet_count, stats->ignored_packet_count);
+            if (len > 0)
+            {
+                eth_print_hex_bytes("eth server", "ignored first bytes", data, len, ETH_ERROR_SNIPPET_BYTES);
+            }
+        }
+        return false;
+    }
+
+    if (len != ETH_MAX_TRANSMIT_SIZE)
+    {
+        stats->bad_packet_count++;
+        stats->length_error_count++;
+        eth_print_packet_context("unexpected packet length", data, len, source_addr, stats);
+        All_Exit_Test_Flag = true;
+        return false;
+    }
+
+    if (len < ETH_TEST_HEADER_SIZE)
+    {
+        stats->bad_packet_count++;
+        stats->length_error_count++;
+        eth_print_packet_context("packet shorter than test header", data, len, source_addr, stats);
+        All_Exit_Test_Flag = true;
+        return false;
+    }
+
+    if (data[0] != 'T' || data[1] != 'S' || data[2] != 'P' || data[3] != 'E')
+    {
+        stats->bad_packet_count++;
+        stats->magic_error_count++;
+        eth_print_packet_context("bad packet magic", data, len, source_addr, stats);
+        printf("[eth server] magic got: %#X %#X %#X %#X | expected: 0X54 0X53 0X50 0X45\n",
+               static_cast<unsigned int>(static_cast<uint8_t>(data[0])),
+               static_cast<unsigned int>(static_cast<uint8_t>(data[1])),
+               static_cast<unsigned int>(static_cast<uint8_t>(data[2])),
+               static_cast<unsigned int>(static_cast<uint8_t>(data[3])));
+        All_Exit_Test_Flag = true;
+        return false;
+    }
+
+    uint32_t sequence = read_u32_le(&data[4]);
+    uint16_t payload_len = read_u16_le(&data[8]);
+    uint16_t header_len = read_u16_le(&data[10]);
+    uint32_t received_checksum = read_u32_le(&data[12]);
+    size_t expected_payload_len = len - ETH_TEST_HEADER_SIZE;
+    const char *payload = data + ETH_TEST_HEADER_SIZE;
+    uint32_t calculated_checksum = eth_calc_checksum(payload, expected_payload_len);
+    bool ok = true;
+
+    if (payload_len != expected_payload_len || header_len != ETH_TEST_HEADER_SIZE)
+    {
+        stats->length_error_count++;
+        ok = false;
+    }
+
+    if (stats->sequence_valid == false)
+    {
+        stats->sequence_valid = true;
+        stats->expected_sequence = sequence;
+    }
+    if (sequence != stats->expected_sequence)
+    {
+        stats->sequence_error_count++;
+        ok = false;
+    }
+
+    size_t mismatch_count = 0;
+    size_t mismatch_offsets[ETH_MISMATCH_PRINT_LIMIT] = {};
+    uint8_t mismatch_expected[ETH_MISMATCH_PRINT_LIMIT] = {};
+    uint8_t mismatch_actual[ETH_MISMATCH_PRINT_LIMIT] = {};
+
+    for (size_t i = 0; i < expected_payload_len; i++)
+    {
+        uint8_t expected_byte = eth_expected_payload_byte(sequence, i);
+        uint8_t actual_byte = static_cast<uint8_t>(payload[i]);
+
+        if (actual_byte != expected_byte)
+        {
+            if (mismatch_count < ETH_MISMATCH_PRINT_LIMIT)
+            {
+                mismatch_offsets[mismatch_count] = ETH_TEST_HEADER_SIZE + i;
+                mismatch_expected[mismatch_count] = expected_byte;
+                mismatch_actual[mismatch_count] = actual_byte;
+            }
+            mismatch_count++;
+        }
+    }
+
+    if (mismatch_count > 0)
+    {
+        stats->payload_error_count++;
+        ok = false;
+    }
+
+    if (received_checksum != calculated_checksum)
+    {
+        stats->checksum_error_count++;
+        ok = false;
+    }
+
+    if (ok == false)
+    {
+        stats->bad_packet_count++;
+        eth_print_packet_context("packet content error", data, len, source_addr, stats);
+        printf("[eth server] sequence: %lu | expected sequence: %lu\n",
+               static_cast<unsigned long>(sequence), static_cast<unsigned long>(stats->expected_sequence));
+        printf("[eth server] header len: %u | payload len: %u | expected payload len: %u\n",
+               static_cast<unsigned int>(header_len), static_cast<unsigned int>(payload_len),
+               static_cast<unsigned int>(expected_payload_len));
+        printf("[eth server] checksum recv: 0X%08lX | calc: 0X%08lX\n",
+               static_cast<unsigned long>(received_checksum), static_cast<unsigned long>(calculated_checksum));
+        printf("[eth server] error counters: source=%zu, length=%zu, magic=%zu, sequence=%zu, payload=%zu, checksum=%zu\n",
+               stats->source_error_count, stats->length_error_count, stats->magic_error_count,
+               stats->sequence_error_count, stats->payload_error_count, stats->checksum_error_count);
+
+        if (mismatch_count > 0)
+        {
+            size_t print_count = (mismatch_count < ETH_MISMATCH_PRINT_LIMIT) ? mismatch_count : ETH_MISMATCH_PRINT_LIMIT;
+            printf("[eth server] payload mismatches: %zu / %u bytes\n",
+                   mismatch_count, static_cast<unsigned int>(expected_payload_len));
+            for (size_t i = 0; i < print_count; i++)
+            {
+                printf("[eth server] mismatch[%zu]: offset=%zu expected=%#X got=%#X\n",
+                       i, mismatch_offsets[i], static_cast<unsigned int>(mismatch_expected[i]),
+                       static_cast<unsigned int>(mismatch_actual[i]));
+            }
+        }
+
+        All_Exit_Test_Flag = true;
+        return false;
+    }
+
+    stats->expected_sequence = sequence + 1;
     return true;
 }
 
@@ -416,11 +725,12 @@ void eth_test_task(void *pv)
 
     struct sockaddr_in server_addr;
     server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(5001);
+    server_addr.sin_port = htons(ETH_SERVER_PORT);
 
     size_t total_size = 0;
     float total_time_s = 0;
     size_t bytes_this_time = 0;
+    size_t packets_this_time = 0;
     int64_t start_time = esp_timer_get_time();
     int64_t last_print_time = start_time;
     int64_t current_time = 0;
@@ -435,7 +745,8 @@ void eth_test_task(void *pv)
 
     if (is_server)
     {
-        server_addr.sin_addr.s_addr = INADDR_ANY;
+        EthPacketStats eth_stats;
+        server_addr.sin_addr.s_addr = ESP_IP4TOADDR(192, 168, 0, 1);
         if (bind(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
         {
             printf("bind fail (errno: %d)\n", errno);
@@ -443,7 +754,10 @@ void eth_test_task(void *pv)
             cleanup_eth();
             return;
         }
-        printf("[eth server] listening on port 5001...\n");
+        printf("[eth server] listening on 192.168.0.1:%u...\n", static_cast<unsigned int>(ETH_SERVER_PORT));
+        printf("[eth server] expect client 192.168.0.2:%u, packet size %u, header %u, sequence + checksum enabled\n",
+               static_cast<unsigned int>(ETH_CLIENT_PORT),
+               static_cast<unsigned int>(ETH_MAX_TRANSMIT_SIZE), static_cast<unsigned int>(ETH_TEST_HEADER_SIZE));
 
         while (!All_Exit_Test_Flag)
         {
@@ -461,10 +775,11 @@ void eth_test_task(void *pv)
             }
             else
             {
-                if (validate_data("eth server", buffer.get(), len, 'A') == true)
+                if (eth_validate_test_packet(buffer.get(), len, &source_addr, &eth_stats) == true)
                 {
                     bytes_this_time += len;
                     total_size += len;
+                    packets_this_time++;
                 }
             }
 
@@ -477,10 +792,12 @@ void eth_test_task(void *pv)
                 float speed_kbps = (float)bytes_this_time / 1024.0f / time_elapsed_sec;
                 float speed_mbps = (float)bytes_this_time * 8.0f / 1024.0f / 1024.0f / time_elapsed_sec;
 
-                printf("[eth server] receive size: %.2f kb | receive speed: %.2f kb/s (%.2f mbps) | total receive size: %.2f kb\n",
-                       (float)bytes_this_time / 1024.0f, speed_kbps, speed_mbps, (float)total_size / 1024.0f);
+                printf("[eth server] receive size: %.2f kb | receive speed: %.2f kb/s (%.2f mbps) | total receive size: %.2f kb | packets: %zu | total packets: %zu | ignored packets: %zu\n",
+                       (float)bytes_this_time / 1024.0f, speed_kbps, speed_mbps, (float)total_size / 1024.0f,
+                       packets_this_time, eth_stats.packet_count, eth_stats.ignored_packet_count);
 
                 bytes_this_time = 0;
+                packets_this_time = 0;
                 last_print_time = current_time;
             }
 
@@ -490,19 +807,40 @@ void eth_test_task(void *pv)
         printf("[eth server] === result ===\n");
         printf("[eth server] total size: %.2f kb\n", total_size / 1024.0);
         printf("[eth server] total time %.3f s\n", total_time_s);
-        printf("[eth server] avg speed: %.2f kb/s\n", (total_size / 1024.0) / total_time_s);
+        printf("[eth server] avg speed: %.2f kb/s\n",
+               (total_time_s > 0.0f) ? ((total_size / 1024.0) / total_time_s) : 0.0);
+        printf("[eth server] packets: %zu | ignored packets: %zu | bad packets: %zu | next expected sequence: %lu\n",
+               eth_stats.packet_count, eth_stats.ignored_packet_count, eth_stats.bad_packet_count,
+               static_cast<unsigned long>(eth_stats.expected_sequence));
     }
     else
     {
+        struct sockaddr_in client_addr;
+        client_addr.sin_family = AF_INET;
+        client_addr.sin_port = htons(ETH_CLIENT_PORT);
+        client_addr.sin_addr.s_addr = ESP_IP4TOADDR(192, 168, 0, 2);
+        if (bind(sock, (struct sockaddr *)&client_addr, sizeof(client_addr)) < 0)
+        {
+            printf("[eth client] bind 192.168.0.2:%u fail (errno: %d)\n",
+                   static_cast<unsigned int>(ETH_CLIENT_PORT), errno);
+
+            cleanup_eth();
+            return;
+        }
+
         server_addr.sin_addr.s_addr = ESP_IP4TOADDR(192, 168, 0, 1);
-        memset(buffer.get(), 'A', ETH_MAX_TRANSMIT_SIZE);
-        printf("[eth client] sending to 192.168.0.1:5001...\n");
+        printf("[eth client] bind 192.168.0.2:%u\n", static_cast<unsigned int>(ETH_CLIENT_PORT));
+        printf("[eth client] sending to 192.168.0.1:%u...\n", static_cast<unsigned int>(ETH_SERVER_PORT));
+        printf("[eth client] packet size %u, header %u, sequence + checksum enabled\n",
+               static_cast<unsigned int>(ETH_MAX_TRANSMIT_SIZE), static_cast<unsigned int>(ETH_TEST_HEADER_SIZE));
 
         size_t send_error_count = 0;
         size_t send_nomem_count = 0;
+        uint32_t send_sequence = 0;
 
         while (!All_Exit_Test_Flag)
         {
+            eth_build_test_packet(buffer.get(), ETH_MAX_TRANSMIT_SIZE, send_sequence);
             int len = sendto(sock, buffer.get(), ETH_MAX_TRANSMIT_SIZE, 0, (struct sockaddr *)&server_addr, sizeof(server_addr));
 
             if (len < 0)
@@ -524,6 +862,17 @@ void eth_test_task(void *pv)
             {
                 bytes_this_time += len;
                 total_size += len;
+                packets_this_time++;
+                if (len == ETH_MAX_TRANSMIT_SIZE)
+                {
+                    send_sequence++;
+                }
+                else
+                {
+                    send_error_count++;
+                    printf("[eth client] partial send: %d / %u bytes\n",
+                           len, static_cast<unsigned int>(ETH_MAX_TRANSMIT_SIZE));
+                }
             }
 
             // 定时打印进度（每秒）
@@ -536,11 +885,13 @@ void eth_test_task(void *pv)
                 float speed_kbps = (float)bytes_this_time / 1024.0f / time_elapsed_sec;
                 float speed_mbps = (float)bytes_this_time * 8.0f / 1024.0f / 1024.0f / time_elapsed_sec;
 
-                printf("[eth client] send size: %.2f kb | send speed: %.2f kb/s (%.2f mbps) | [eth client] total send size: %.2f kb | send errors: %zu, nomem: %zu\n",
+                printf("[eth client] send size: %.2f kb | send speed: %.2f kb/s (%.2f mbps) | [eth client] total send size: %.2f kb | packets: %zu | next sequence: %lu | send errors: %zu, nomem: %zu\n",
                        (float)bytes_this_time / 1024.0f, speed_kbps, speed_mbps, (float)total_size / 1024.0f,
+                       packets_this_time, static_cast<unsigned long>(send_sequence),
                        send_error_count, send_nomem_count);
 
                 bytes_this_time = 0;
+                packets_this_time = 0;
                 send_error_count = 0;
                 send_nomem_count = 0;
                 last_print_time = current_time;
@@ -552,7 +903,9 @@ void eth_test_task(void *pv)
         printf("[eth client] === result ===\n");
         printf("[eth client] total size: %.2f kb\n", total_size / 1024.0);
         printf("[eth client] total time %.3f s\n", total_time_s);
-        printf("[eth client] avg speed: %.2f kb/s\n", (total_size / 1024.0) / total_time_s);
+        printf("[eth client] avg speed: %.2f kb/s\n",
+               (total_time_s > 0.0f) ? ((total_size / 1024.0) / total_time_s) : 0.0);
+        printf("[eth client] next sequence: %lu\n", static_cast<unsigned long>(send_sequence));
     }
 
     cleanup_eth();
