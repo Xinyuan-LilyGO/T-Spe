@@ -2,7 +2,7 @@
  * @Description: general_test
  * @Author: LILYGO_L
  * @Date: 2026-01-29 17:59:59
- * @LastEditTime: 2026-06-03 15:44:11
+ * @LastEditTime: 2026-06-04 11:54:38
  * @License: GPL 3.0
  */
 #include "lilygo_device_driver_library.h"
@@ -17,11 +17,17 @@
 #include "esp_timer.h"
 #include "esp_app_desc.h"
 #include "esp_sntp.h"
+#include "esp_err.h"
+#include "sdkconfig.h"
+#if CONFIG_ETHERNET_USE_PLCA
+#include "esp_eth_phy_lan86xx.h"
+#endif
 #include <vector>
 #include <string>
 #include <sstream>
 #include <time.h>
 #include <sys/time.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -35,7 +41,11 @@
 #define WIFI_TIMEZONE "CST-8"
 #define WIFI_NTP_SERVER_0 "ntp.aliyun.com"
 
-#define ETH_MAX_TRANSMIT_SIZE 1024 * 5
+#define ETH_MAX_TRANSMIT_SIZE 1400
+#define ETH_TASK_LOOP_DELAY_MS 2
+#define ETH_SEND_BACKOFF_DELAY_MS 20
+#define ETH_START_WAIT_MS 2000
+#define ETH_STOP_WAIT_MS 100
 #define RS485_MAX_TRANSMIT_SIZE 1024
 
 bool Wifi_Connect_Flag = false;
@@ -145,6 +155,47 @@ bool validate_data(const char *tag, const char *data, size_t len, char expected_
     return true;
 }
 
+#if CONFIG_ETHERNET_USE_PLCA
+static bool eth_plca_ioctl(esp_eth_handle_t eth_handle, esp_eth_io_cmd_t cmd, void *value, const char *name)
+{
+    esp_err_t err = esp_eth_ioctl(eth_handle, cmd, value);
+    if (err != ESP_OK)
+    {
+        printf("[eth] PLCA %s fail: %s\n", name, esp_err_to_name(err));
+        return false;
+    }
+
+    return true;
+}
+
+static bool configure_eth_plca(esp_eth_handle_t eth_handle, bool is_server)
+{
+    bool enable = false;
+    bool ok = true;
+    uint8_t node_count = 2;
+    uint8_t plca_id = is_server ? 0 : 1;
+    uint8_t burst_count = 0;
+    uint8_t transmit_opportunity_timer = 32;
+
+    ok = eth_plca_ioctl(eth_handle, (esp_eth_io_cmd_t)LAN86XX_ETH_CMD_S_EN_PLCA, &enable, "disable") && ok;
+    ok = eth_plca_ioctl(eth_handle, (esp_eth_io_cmd_t)LAN86XX_ETH_CMD_S_PLCA_NCNT, &node_count, "set node count") && ok;
+    ok = eth_plca_ioctl(eth_handle, (esp_eth_io_cmd_t)LAN86XX_ETH_CMD_S_PLCA_ID, &plca_id, "set id") && ok;
+    ok = eth_plca_ioctl(eth_handle, (esp_eth_io_cmd_t)LAN86XX_ETH_CMD_S_MAX_BURST_COUNT, &burst_count, "set burst count") && ok;
+    ok = eth_plca_ioctl(eth_handle, (esp_eth_io_cmd_t)LAN86XX_ETH_CMD_S_PLCA_TOT, &transmit_opportunity_timer, "set TOT") && ok;
+
+    enable = true;
+    ok = eth_plca_ioctl(eth_handle, (esp_eth_io_cmd_t)LAN86XX_ETH_CMD_S_EN_PLCA, &enable, "enable") && ok;
+    if (ok == false)
+    {
+        return false;
+    }
+
+    printf("[eth] PLCA enabled, role: %s, id: %u, node count: %u\n",
+           is_server ? "coordinator" : "follower", plca_id, node_count);
+    return true;
+}
+#endif
+
 void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START)
@@ -236,43 +287,132 @@ void eth_test_task(void *pv)
     bool is_server = (bool)pv;
     printf("eth_test_task (%s) start\n", is_server ? "server" : "client");
 
+    int sock = -1;
+    bool eth_started = false;
+    esp_eth_handle_t *eth_handle = nullptr;
+    esp_eth_netif_glue_handle_t eth_netif_glues[1] = {};
+
     esp_netif_config_t cfg = ESP_NETIF_DEFAULT_ETH();
     esp_netif_t *eth_netif = esp_netif_new(&cfg);
-    esp_netif_dhcpc_stop(eth_netif);
-
-    esp_netif_ip_info_t ip_info;
-    ip_info.ip.addr = ESP_IP4TOADDR(192, 168, 0, (is_server ? 1 : 2));
-    ip_info.netmask.addr = ESP_IP4TOADDR(255, 255, 255, 0);
-    ip_info.gw.addr = ESP_IP4TOADDR(0, 0, 0, 0);
-    esp_netif_set_ip_info(eth_netif, &ip_info);
-
-    uint8_t eth_port = 0;
-    esp_eth_handle_t *eth_handle;
-    esp_eth_netif_glue_handle_t eth_netif_glues[1];
-    ethernet_init_all(&eth_handle, &eth_port);
-    eth_netif_glues[0] = esp_eth_new_netif_glue(eth_handle[0]);
-    esp_netif_attach(eth_netif, eth_netif_glues[0]);
-    esp_eth_start(eth_handle[0]);
-
-    // 等待链路稳定
-    vTaskDelay(pdMS_TO_TICKS(1000));
-
-    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-    if (sock < 0)
+    if (eth_netif == nullptr)
     {
-        printf("socket fail (errno: %d)\n", errno);
-
+        printf("[eth] esp_netif_new fail\n");
         printf("[eth] task completed\n");
         Eth_Test_Task_Handle = nullptr;
         vTaskDelete(NULL);
         return;
     }
 
+    auto cleanup_eth = [&]() {
+        if (sock >= 0)
+        {
+            close(sock);
+        }
+        if (eth_started == true && eth_handle != nullptr)
+        {
+            esp_eth_stop(eth_handle[0]);
+            vTaskDelay(pdMS_TO_TICKS(ETH_STOP_WAIT_MS));
+        }
+        if (eth_netif_glues[0] != nullptr)
+        {
+            esp_eth_del_netif_glue(eth_netif_glues[0]);
+        }
+        if (eth_netif != nullptr)
+        {
+            esp_netif_destroy(eth_netif);
+        }
+        if (eth_handle != nullptr)
+        {
+            ethernet_deinit_all(eth_handle);
+        }
+
+        printf("[eth] task completed\n");
+        Eth_Test_Task_Handle = nullptr;
+        vTaskDelete(NULL);
+    };
+
+    esp_netif_dhcpc_stop(eth_netif);
+
+    esp_netif_ip_info_t ip_info;
+    ip_info.ip.addr = ESP_IP4TOADDR(192, 168, 0, (is_server ? 1 : 2));
+    ip_info.netmask.addr = ESP_IP4TOADDR(255, 255, 255, 0);
+    ip_info.gw.addr = ESP_IP4TOADDR(0, 0, 0, 0);
+    esp_err_t err = esp_netif_set_ip_info(eth_netif, &ip_info);
+    if (err != ESP_OK)
+    {
+        printf("[eth] esp_netif_set_ip_info fail: %s\n", esp_err_to_name(err));
+        cleanup_eth();
+        return;
+    }
+
+    uint8_t eth_port = 0;
+    err = ethernet_init_all(&eth_handle, &eth_port);
+    if (err != ESP_OK || eth_handle == nullptr || eth_port == 0)
+    {
+        printf("[eth] ethernet_init_all fail: %s, port count: %u\n", esp_err_to_name(err), eth_port);
+        cleanup_eth();
+        return;
+    }
+#if CONFIG_ETHERNET_USE_PLCA
+    if (configure_eth_plca(eth_handle[0], is_server) == false)
+    {
+        cleanup_eth();
+        return;
+    }
+#endif
+    eth_netif_glues[0] = esp_eth_new_netif_glue(eth_handle[0]);
+    if (eth_netif_glues[0] == nullptr)
+    {
+        printf("[eth] esp_eth_new_netif_glue fail\n");
+        cleanup_eth();
+        return;
+    }
+
+    err = esp_netif_attach(eth_netif, eth_netif_glues[0]);
+    if (err != ESP_OK)
+    {
+        printf("[eth] esp_netif_attach fail: %s\n", esp_err_to_name(err));
+        cleanup_eth();
+        return;
+    }
+
+    err = esp_eth_start(eth_handle[0]);
+    if (err != ESP_OK)
+    {
+        printf("[eth] esp_eth_start fail: %s\n", esp_err_to_name(err));
+        cleanup_eth();
+        return;
+    }
+    eth_started = true;
+
+    // 等待链路稳定
+    vTaskDelay(pdMS_TO_TICKS(ETH_START_WAIT_MS));
+
+    sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (sock < 0)
+    {
+        printf("socket fail (errno: %d)\n", errno);
+
+        cleanup_eth();
+        return;
+    }
+
+    int reuse_addr = 1;
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse_addr, sizeof(reuse_addr)) < 0)
+    {
+        printf("[eth] setsockopt SO_REUSEADDR fail (errno: %d)\n", errno);
+    }
+
     // 设置超时：防止 recvfrom 永久阻塞
     struct timeval timeout;
     timeout.tv_sec = 1;
     timeout.tv_usec = 0;
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0)
+    {
+        printf("[eth] setsockopt SO_RCVTIMEO fail (errno: %d)\n", errno);
+        cleanup_eth();
+        return;
+    }
 
     struct sockaddr_in server_addr;
     server_addr.sin_family = AF_INET;
@@ -299,11 +439,8 @@ void eth_test_task(void *pv)
         if (bind(sock, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
         {
             printf("bind fail (errno: %d)\n", errno);
-            close(sock);
 
-            printf("[eth] task completed\n");
-            Eth_Test_Task_Handle = nullptr;
-            vTaskDelete(NULL);
+            cleanup_eth();
             return;
         }
         printf("[eth server] listening on port 5001...\n");
@@ -347,7 +484,7 @@ void eth_test_task(void *pv)
                 last_print_time = current_time;
             }
 
-            vTaskDelay(pdMS_TO_TICKS(5));
+            vTaskDelay(pdMS_TO_TICKS(ETH_TASK_LOOP_DELAY_MS));
         }
 
         printf("[eth server] === result ===\n");
@@ -361,14 +498,27 @@ void eth_test_task(void *pv)
         memset(buffer.get(), 'A', ETH_MAX_TRANSMIT_SIZE);
         printf("[eth client] sending to 192.168.0.1:5001...\n");
 
+        size_t send_error_count = 0;
+        size_t send_nomem_count = 0;
+
         while (!All_Exit_Test_Flag)
         {
             int len = sendto(sock, buffer.get(), ETH_MAX_TRANSMIT_SIZE, 0, (struct sockaddr *)&server_addr, sizeof(server_addr));
 
             if (len < 0)
             {
-                printf("[eth client] send error: %d\n", errno);
-                vTaskDelay(pdMS_TO_TICKS(100));
+                int send_errno = errno;
+                send_error_count++;
+                if (send_errno == ENOMEM)
+                {
+                    send_nomem_count++;
+                    vTaskDelay(pdMS_TO_TICKS(ETH_SEND_BACKOFF_DELAY_MS));
+                }
+                else
+                {
+                    printf("[eth client] send error: %d\n", send_errno);
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
             }
             else
             {
@@ -386,14 +536,17 @@ void eth_test_task(void *pv)
                 float speed_kbps = (float)bytes_this_time / 1024.0f / time_elapsed_sec;
                 float speed_mbps = (float)bytes_this_time * 8.0f / 1024.0f / 1024.0f / time_elapsed_sec;
 
-                printf("[eth client] send size: %.2f kb | send speed: %.2f kb/s (%.2f mbps) | [eth client] total send size: %.2f kb\n",
-                       (float)bytes_this_time / 1024.0f, speed_kbps, speed_mbps, (float)total_size / 1024.0f);
+                printf("[eth client] send size: %.2f kb | send speed: %.2f kb/s (%.2f mbps) | [eth client] total send size: %.2f kb | send errors: %zu, nomem: %zu\n",
+                       (float)bytes_this_time / 1024.0f, speed_kbps, speed_mbps, (float)total_size / 1024.0f,
+                       send_error_count, send_nomem_count);
 
                 bytes_this_time = 0;
+                send_error_count = 0;
+                send_nomem_count = 0;
                 last_print_time = current_time;
             }
 
-            vTaskDelay(pdMS_TO_TICKS(5));
+            vTaskDelay(pdMS_TO_TICKS(ETH_TASK_LOOP_DELAY_MS));
         }
 
         printf("[eth client] === result ===\n");
@@ -402,16 +555,7 @@ void eth_test_task(void *pv)
         printf("[eth client] avg speed: %.2f kb/s\n", (total_size / 1024.0) / total_time_s);
     }
 
-    close(sock);
-
-    esp_eth_stop(eth_handle[0]);
-    esp_eth_del_netif_glue(eth_netif_glues[0]);
-    esp_netif_destroy(eth_netif);
-    ethernet_deinit_all(eth_handle);
-
-    printf("[eth] task completed\n");
-    Eth_Test_Task_Handle = nullptr;
-    vTaskDelete(NULL);
+    cleanup_eth();
 }
 
 void rs485_test_task(void *pv)

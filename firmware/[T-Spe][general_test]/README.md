@@ -1,5 +1,11 @@
 # Firmware Modification Log
 
+## 202606041157
+### Changed firmware
+- `[T-Spe][general_test]_firmware_202606041157`
+### Change content
+- 降低以太网传输速度，开启ETHERNET_USE_PLCA开启LWIP_CHECKSUM_CHECK_UDP
+
 ## 202606031721
 ### Changed firmware
 - `[T-Spe][general_test]_firmware_202606031721`

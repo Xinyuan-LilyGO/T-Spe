@@ -21,6 +21,7 @@ idf_component_register(SRC_DIRS ${project_path}
                         esp_event
                         esp_netif
                         esp_eth
+                        espressif__lan86xx_common
                         lwip
                         ethernet_init
                         esp_timer
